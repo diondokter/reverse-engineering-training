@@ -95,6 +95,9 @@ async fn main(spawner: Spawner) {
         (ep_in, ep_out)
     };
 
+    defmt::info!("{}", ep_in.info());
+    defmt::info!("{}", ep_out.info());
+
     let mut usb = builder.build();
 
     let usb_app = async {
@@ -120,9 +123,11 @@ async fn listen(
 
     loop {
         let len = ep_out.read(&mut buffer).await?;
-        let received = &buffer[..len];
+        let received = &mut buffer[..len];
 
         defmt::info!("Received: {:X}", received);
+
+        received.iter_mut().for_each(|x| *x = *x + 1);
 
         ep_in.write(received).await?;
     }

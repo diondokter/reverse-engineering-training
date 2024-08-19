@@ -1,0 +1,1 @@
+To find out which native libs are used, compile with `cargo rustc -- --print native-static-libs`
