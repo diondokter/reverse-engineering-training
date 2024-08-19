@@ -5,38 +5,126 @@ use core::sync::atomic::AtomicBool;
 
 use embassy_executor::Spawner;
 use embassy_nrf::{
-    gpio::{Level, Output, OutputDrive},
-    peripherals::PWM0,
+    bind_interrupts, pac,
+    peripherals::{PWM0, USBD},
     pwm::{self, SequencePwm},
+    usb::{self, In, Out},
 };
-use embassy_time::Duration;
+use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointOut};
 use {defmt_rtt as _, panic_probe as _};
+
+bind_interrupts!(struct Irqs {
+    USBD => usb::InterruptHandler<embassy_nrf::peripherals::USBD>;
+    POWER_CLOCK => usb::vbus_detect::InterruptHandler;
+});
+
+// This is a randomly generated GUID to allow clients on Windows to find our device
+const DEVICE_INTERFACE_GUIDS: &[&str] = &["{EAA9A5DC-30BA-44BC-9232-606CDC875321}"];
+const MAX_PACKET_SIZE: usize = 64;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
+    let clock: pac::CLOCK = unsafe { core::mem::transmute(()) };
 
-    // let mut led1 = Output::new(p.P0_13, Level::High, OutputDrive::Standard0Disconnect1);
+    defmt::info!("Enabling ext hfosc...");
+    clock.tasks_hfclkstart.write(|w| unsafe { w.bits(1) });
+    while clock.events_hfclkstarted.read().bits() != 1 {}
 
-    defmt::info!("Hello!");
+    defmt::info!("Initialized!");
 
-    // let mut t = embassy_time::Ticker::every(Duration::from_millis(200));
-    // loop {
-    //     led1.toggle();
-    //     t.next().await;
-    // }
-
+    // Setup the LED PWM
     let mut config = pwm::Config::default();
-    config.prescaler = pwm::Prescaler::Div128;
-    // 1 period is 1000 * (128/16mhz = 0.000008s = 0.008ms) = 8ms
-
+    config.prescaler = pwm::Prescaler::Div64;
     let pwm = defmt::unwrap!(pwm::SequencePwm::new_1ch(p.PWM0, p.P0_13, config));
-
     spawner.must_spawn(led_driver(pwm));
 
+    // Setup the USB
+    // Create the driver, from the HAL.
+    let driver = usb::Driver::new(
+        p.USBD,
+        Irqs,
+        usb::vbus_detect::HardwareVbusDetect::new(Irqs),
+    );
+
+    // Create embassy-usb Config
+    let mut config = embassy_usb::Config::new(0xc0de, 0xcafe);
+    config.manufacturer = Some("Cring Electronics");
+    config.product = Some("Video acceleratorinator");
+    config.serial_number = Some("12345678");
+    config.max_power = 100;
+    config.max_packet_size_0 = 64;
+    config.device_class = 0xFF;
+    config.device_sub_class = 0x00;
+    config.device_protocol = 0x00;
+    config.composite_with_iads = false;
+
+    // Create embassy-usb DeviceBuilder using the driver and config.
+    // It needs some buffers for building the descriptors.
+    let mut config_descriptor = [0; 32];
+    let mut bos_descriptor = [0; 40];
+    let mut msos_descriptor = [0; 162];
+    let mut control_buf = [0; 64];
+
+    let mut builder = embassy_usb::Builder::new(
+        driver,
+        config,
+        &mut config_descriptor,
+        &mut bos_descriptor,
+        &mut msos_descriptor,
+        &mut control_buf,
+    );
+
+    builder.msos_descriptor(embassy_usb::msos::windows_version::WIN8_1, 0);
+    builder.msos_feature(embassy_usb::msos::CompatibleIdFeatureDescriptor::new(
+        "WINUSB", "",
+    ));
+    builder.msos_feature(embassy_usb::msos::RegistryPropertyFeatureDescriptor::new(
+        "DeviceInterfaceGUIDs",
+        embassy_usb::msos::PropertyData::RegMultiSz(DEVICE_INTERFACE_GUIDS),
+    ));
+
+    let (mut ep_in, mut ep_out) = {
+        let mut func = builder.function(0xFF, 0x00, 0x00);
+        let mut iface = func.interface();
+        let mut alt = iface.alt_setting(0xFF, 0x00, 0x00, None);
+
+        let ep_in = alt.endpoint_bulk_in(MAX_PACKET_SIZE as u16);
+        let ep_out = alt.endpoint_bulk_out(MAX_PACKET_SIZE as u16);
+
+        (ep_in, ep_out)
+    };
+
+    let mut usb = builder.build();
+
+    let usb_app = async {
+        loop {
+            if let Err(e) = listen(&mut ep_in, &mut ep_out).await {
+                defmt::error!("Endpoint error: {}", e);
+            }
+        }
+    };
+
+    embassy_futures::join::join(usb.run(), usb_app).await;
+}
+
+async fn listen(
+    ep_in: &mut embassy_nrf::usb::Endpoint<'_, USBD, In>,
+    ep_out: &mut embassy_nrf::usb::Endpoint<'_, USBD, Out>,
+) -> Result<(), EndpointError> {
+    let mut buffer = [0; MAX_PACKET_SIZE];
+
+    ep_out.wait_enabled().await;
+
+    defmt::info!("Connected!");
+
     loop {
-        embassy_time::Timer::after_millis(10000).await;
-        GLITCHY.fetch_xor(true, core::sync::atomic::Ordering::Relaxed);
+        let len = ep_out.read(&mut buffer).await?;
+        let received = &buffer[..len];
+
+        defmt::info!("Received: {:X}", received);
+
+        ep_in.write(received).await?;
     }
 }
 
@@ -62,7 +150,7 @@ async fn led_driver(mut pwm: SequencePwm<'static, PWM0>) {
         sequencer = pwm::SingleSequencer::new(&mut pwm, selected_words, seq_config.clone());
         defmt::unwrap!(sequencer.start(pwm::SingleSequenceMode::Infinite));
 
-        embassy_time::Timer::after_millis(2400).await;
+        embassy_time::Timer::after_millis(1200).await;
         drop(sequencer);
     }
 }
