@@ -9,7 +9,7 @@ use std::{
 
 fn main() -> anyhow::Result<()> {
     let mut image = Vec::new();
-    File::open("Cring electronics inverted.bmp")
+    File::open("Bird inverted.bmp")
         .unwrap()
         .read_to_end(&mut image)
         .unwrap();
@@ -27,21 +27,16 @@ fn main() -> anyhow::Result<()> {
             )
         })?;
 
-        loop {
-            println!("Sending BMP image");
-            wrap(|| {
-                acceleratorinator_sys::cring_acc_send_bmp(
-                    connection,
-                    image.as_mut_ptr(),
-                    image.len(),
-                )
-            })?;
+        println!("Sending BMP image");
+        wrap(|| {
+            acceleratorinator_sys::cring_acc_send_bmp(connection, image.as_mut_ptr(), image.len())
+        })?;
 
-            // File::create("Cring electronics returned.bmp")
-            //     .unwrap()
-            //     .write_all(&image)
-            //     .unwrap();
-        }
+        File::create("Bird returned.bmp")
+            .unwrap()
+            .write_all(&image)
+            .unwrap();
+
         println!("Done. Freeing USB");
         wrap(|| acceleratorinator_sys::cring_usb_free(&mut connection as *mut _))?;
     }

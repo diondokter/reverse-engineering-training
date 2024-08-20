@@ -170,22 +170,34 @@ async fn listen(
                             break 'e Error::UnsupportedCompression;
                         }
 
+                        let color_ranges = if let Some(channel_masks) = header.channel_masks {
+                            let start = channel_masks.red.trailing_zeros() as usize;
+                            let end = 32 - channel_masks.red.leading_zeros() as usize;
+                            let red_range = start..end;
+
+                            let start = channel_masks.green.trailing_zeros() as usize;
+                            let end = 32 - channel_masks.green.leading_zeros() as usize;
+                            let green_range = start..end;
+
+                            let start = channel_masks.blue.trailing_zeros() as usize;
+                            let end = 32 - channel_masks.blue.leading_zeros() as usize;
+                            let blue_range = start..end;
+
+                            Some((red_range, green_range, blue_range))
+                        } else {
+                            None
+                        };
+
                         for pixel in image_bits_view.chunks_exact_mut(header.bpp.bits() as usize) {
-                            if let Some(channel_masks) = header.channel_masks {
-                                let start = channel_masks.red.trailing_zeros() as usize;
-                                let end = 32 - channel_masks.red.leading_zeros() as usize;
-                                let value = pixel[start..end].load_le::<u8>();
-                                pixel[start..end].store_le(u8::MAX - value);
+                            if let Some((red, green, blue)) = color_ranges.as_ref() {
+                                let value = pixel[red.clone()].load_le::<u8>();
+                                pixel[red.clone()].store_le(u8::MAX - value);
 
-                                let start = channel_masks.green.trailing_zeros() as usize;
-                                let end = 32 - channel_masks.green.leading_zeros() as usize;
-                                let value = pixel[start..end].load_le::<u8>();
-                                pixel[start..end].store_le(u8::MAX - value);
+                                let value = pixel[green.clone()].load_le::<u8>();
+                                pixel[green.clone()].store_le(u8::MAX - value);
 
-                                let start = channel_masks.blue.trailing_zeros() as usize;
-                                let end = 32 - channel_masks.blue.leading_zeros() as usize;
-                                let value = pixel[start..end].load_le::<u8>();
-                                pixel[start..end].store_le(u8::MAX - value);
+                                let value = pixel[blue.clone()].load_le::<u8>();
+                                pixel[blue.clone()].store_le(u8::MAX - value);
                             } else {
                                 pixel.store_le(u32::MAX - pixel.load_le::<u32>());
                             }
