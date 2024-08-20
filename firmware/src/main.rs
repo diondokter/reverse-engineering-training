@@ -1,21 +1,28 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::AtomicBool;
+use core::{
+    panic::PanicInfo,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
+use bitvec::{field::BitField, order::Lsb0, view::BitView};
+use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_nrf::{
     bind_interrupts, pac,
     peripherals::{PWM0, USBD},
     pwm::{self, SequencePwm},
+    uarte::{self, UarteTx},
     usb::{self, In, Out},
 };
+use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, mutex::Mutex};
 use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointOut};
-use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<embassy_nrf::peripherals::USBD>;
     POWER_CLOCK => usb::vbus_detect::InterruptHandler;
+    UARTE0_UART0 => uarte::InterruptHandler<embassy_nrf::peripherals::UARTE0>;
 });
 
 // This is a randomly generated GUID to allow clients on Windows to find our device
@@ -103,6 +110,7 @@ async fn main(spawner: Spawner) {
     let usb_app = async {
         loop {
             if let Err(e) = listen(&mut ep_in, &mut ep_out).await {
+                GLITCHY.store(true, Ordering::Relaxed);
                 defmt::error!("Endpoint error: {}", e);
             }
         }
@@ -111,26 +119,119 @@ async fn main(spawner: Spawner) {
     embassy_futures::join::join(usb.run(), usb_app).await;
 }
 
+static BMP_BUFFER: Mutex<ThreadModeRawMutex, [u8; 128 * 1024]> = Mutex::new([0; 128 * 1024]);
+
 async fn listen(
     ep_in: &mut embassy_nrf::usb::Endpoint<'_, USBD, In>,
     ep_out: &mut embassy_nrf::usb::Endpoint<'_, USBD, Out>,
 ) -> Result<(), EndpointError> {
-    let mut buffer = [0; MAX_PACKET_SIZE];
+    let mut bmp_buffer = BMP_BUFFER.lock().await;
+    let bmp_buffer = &mut *bmp_buffer;
+    let mut bmp_cursor = 0;
 
     ep_out.wait_enabled().await;
 
     defmt::info!("Connected!");
 
     loop {
-        let len = ep_out.read(&mut buffer).await?;
-        let received = &mut buffer[..len];
+        let len = ep_out.read(&mut bmp_buffer[bmp_cursor..]).await?;
+        bmp_cursor += len;
 
-        defmt::info!("Received: {:X}", received);
+        if len == 0 {
+            defmt::info!(
+                "@ {} - Received bmp, total: {}",
+                embassy_time::Instant::now().as_millis(),
+                bmp_cursor
+            );
 
-        received.iter_mut().for_each(|x| *x = *x + 1);
+            // Last message, so do the bmp thing
+            let error = 'e: {
+                match tinybmp::RawBmp::from_slice(&bmp_buffer[..bmp_cursor]) {
+                    Ok(bmp) => {
+                        let header = bmp.header().clone();
 
-        ep_in.write(received).await?;
+                        let image_data_len = if header.image_data_len == 0 {
+                            (header.image_size.width
+                                * header.image_size.height
+                                * header.bpp.bits() as u32
+                                / 8) as usize
+                        } else {
+                            header.image_data_len as usize
+                        };
+
+                        let image_bits_view = bmp_buffer[header.image_data_start..]
+                            [..image_data_len]
+                            .view_bits_mut::<Lsb0>();
+
+                        if matches!(
+                            header.compression_method,
+                            tinybmp::CompressionMethod::Rle4 | tinybmp::CompressionMethod::Rle8
+                        ) {
+                            break 'e Error::UnsupportedCompression;
+                        }
+
+                        for pixel in image_bits_view.chunks_exact_mut(header.bpp.bits() as usize) {
+                            if let Some(channel_masks) = header.channel_masks {
+                                let start = channel_masks.red.trailing_zeros() as usize;
+                                let end = 32 - channel_masks.red.leading_zeros() as usize;
+                                let value = pixel[start..end].load_le::<u8>();
+                                pixel[start..end].store_le(u8::MAX - value);
+
+                                let start = channel_masks.green.trailing_zeros() as usize;
+                                let end = 32 - channel_masks.green.leading_zeros() as usize;
+                                let value = pixel[start..end].load_le::<u8>();
+                                pixel[start..end].store_le(u8::MAX - value);
+
+                                let start = channel_masks.blue.trailing_zeros() as usize;
+                                let end = 32 - channel_masks.blue.leading_zeros() as usize;
+                                let value = pixel[start..end].load_le::<u8>();
+                                pixel[start..end].store_le(u8::MAX - value);
+                            } else {
+                                pixel.store_le(u32::MAX - pixel.load_le::<u32>());
+                            }
+                        }
+                        Error::Ok
+                    }
+                    Err(e) => {
+                        defmt::error!("BMP parse error: {}", defmt::Debug2Format(&e));
+                        Error::ParseError
+                    }
+                }
+            };
+
+            defmt::info!(
+                "@ {} - Processing done. Starting send back",
+                embassy_time::Instant::now().as_millis(),
+            );
+
+            ep_in.write(&[error as u8]).await?;
+
+            if let Error::Ok = error {
+                GLITCHY.store(false, Ordering::Relaxed);
+
+                for chunk in bmp_buffer[..bmp_cursor].chunks(MAX_PACKET_SIZE) {
+                    ep_in.write(chunk).await?;
+                }
+            } else {
+                GLITCHY.store(true, Ordering::Relaxed);
+            }
+
+            defmt::info!(
+                "@ {} - Send back complete. Waiting for next bmp",
+                embassy_time::Instant::now().as_millis(),
+            );
+
+            bmp_cursor = 0;
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Error {
+    Ok,
+    UnsupportedCompression,
+    ParseError,
 }
 
 static GLITCHY: AtomicBool = AtomicBool::new(false);
@@ -146,7 +247,7 @@ async fn led_driver(mut pwm: SequencePwm<'static, PWM0>) {
     let mut sequencer;
 
     loop {
-        let selected_words = if GLITCHY.load(core::sync::atomic::Ordering::Relaxed) {
+        let selected_words = if GLITCHY.fetch_xor(true, Ordering::Relaxed) {
             &glitch_words
         } else {
             &sin_words
@@ -191,3 +292,35 @@ const GLITCHY_SIN: [u16; 150] = [
     0x006E, 0x0094, 0x005B, 0x0037, 0x0089, 0x003F, 0x000F, 0x000F, 0x005E, 0x002A, 0x00FB, 0x00E5,
     0x0057, 0x00BE, 0x0079, 0x0078, 0x016A, 0x00CD,
 ];
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    use core::fmt::Write;
+
+    cortex_m::interrupt::disable();
+
+    defmt::error!("{}", defmt::Debug2Format(info));
+
+    let uart = uarte::UarteTx::new(
+        unsafe { embassy_nrf::peripherals::UARTE0::steal() },
+        Irqs,
+        unsafe { embassy_nrf::peripherals::P0_06::steal() },
+        Default::default(),
+    );
+
+    write!(UartWriter(uart), "{info}").ok();
+
+    loop {
+        cortex_m::asm::bkpt();
+    }
+}
+
+struct UartWriter(UarteTx<'static, embassy_nrf::peripherals::UARTE0>);
+
+impl core::fmt::Write for UartWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.0
+            .blocking_write(s.as_bytes())
+            .map_err(|_| Default::default())
+    }
+}

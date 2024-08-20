@@ -1,6 +1,19 @@
-use std::{error::Error, ffi::c_int, fmt::Display, ptr::null_mut};
+use std::{
+    error::Error,
+    ffi::c_int,
+    fmt::Display,
+    fs::File,
+    io::{Read, Write},
+    ptr::null_mut,
+};
 
 fn main() -> anyhow::Result<()> {
+    let mut image = Vec::new();
+    File::open("Cring electronics inverted.bmp")
+        .unwrap()
+        .read_to_end(&mut image)
+        .unwrap();
+
     let mut connection = null_mut();
     unsafe {
         println!("Creating USB");
@@ -14,15 +27,21 @@ fn main() -> anyhow::Result<()> {
             )
         })?;
 
-        bulk_out(
-            connection,
-            acceleratorinator_sys::CRING_ACC_BOUT_EP as u8,
-            &vec![0; 64],
-        )?;
+        loop {
+            println!("Sending BMP image");
+            wrap(|| {
+                acceleratorinator_sys::cring_acc_send_bmp(
+                    connection,
+                    image.as_mut_ptr(),
+                    image.len(),
+                )
+            })?;
 
-        let received = bulk_in(connection, acceleratorinator_sys::CRING_ACC_BIN_EP as u8, 64)?;
-        println!("Received {}: {:?}", received.len(), received);
-
+            // File::create("Cring electronics returned.bmp")
+            //     .unwrap()
+            //     .write_all(&image)
+            //     .unwrap();
+        }
         println!("Done. Freeing USB");
         wrap(|| acceleratorinator_sys::cring_usb_free(&mut connection as *mut _))?;
     }
@@ -30,32 +49,32 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn bulk_out(
-    connection: *mut acceleratorinator_sys::UsbConnection,
-    ep: u8,
-    data: &[u8],
-) -> Result<(), CringError> {
-    wrap(|| unsafe {
-        acceleratorinator_sys::cring_usb_bulk_out(connection, ep, data.as_ptr(), data.len())
-    })?;
-    Ok(())
-}
+// fn bulk_out(
+//     connection: *mut acceleratorinator_sys::CringUsbConnection,
+//     ep: u8,
+//     data: &[u8],
+// ) -> Result<(), CringError> {
+//     wrap(|| unsafe {
+//         acceleratorinator_sys::cring_usb_bulk_out(connection, ep, data.as_ptr(), data.len())
+//     })?;
+//     Ok(())
+// }
 
-fn bulk_in(
-    connection: *mut acceleratorinator_sys::UsbConnection,
-    ep: u8,
-    len: usize,
-) -> Result<Vec<u8>, CringError> {
-    let mut buffer = vec![0; len];
+// fn bulk_in(
+//     connection: *mut acceleratorinator_sys::CringUsbConnection,
+//     ep: u8,
+//     len: usize,
+// ) -> Result<Vec<u8>, CringError> {
+//     let mut buffer = vec![0; len];
 
-    let received_len = wrap(|| unsafe {
-        acceleratorinator_sys::cring_usb_bulk_in(connection, ep, buffer.as_mut_ptr(), len)
-    })?;
+//     let received_len = wrap(|| unsafe {
+//         acceleratorinator_sys::cring_usb_bulk_in(connection, ep, buffer.as_mut_ptr(), len)
+//     })?;
 
-    buffer.truncate(received_len as usize);
+//     buffer.truncate(received_len as usize);
 
-    Ok(buffer)
-}
+//     Ok(buffer)
+// }
 
 fn wrap(f: impl FnOnce() -> c_int) -> Result<u32, CringError> {
     let val = f();
@@ -79,6 +98,10 @@ impl Display for CringError {
             acceleratorinator_sys::CRING_EINVAL => write!(f, "INVAL")?,
             acceleratorinator_sys::CRING_ENOTPRESENT => write!(f, "NOTPRESENT")?,
             acceleratorinator_sys::CRING_EUSB => write!(f, "USB")?,
+
+            acceleratorinator_sys::CRING_EACC_UNKNOWN => write!(f, "ACC_UNKNOWN")?,
+            acceleratorinator_sys::CRING_EACC_UNSUP_COMP => write!(f, "ACC_UNSUP_COMP")?,
+            acceleratorinator_sys::CRING_EACC_PARSE => write!(f, "ACC_PARSE")?,
             _ => unimplemented!(),
         }
 

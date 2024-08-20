@@ -4,13 +4,13 @@ use std::{ffi::c_int, ptr::null_mut};
 
 extern crate nusb;
 
-pub struct UsbConnection {
+pub struct CringUsbConnection {
     interface: Option<nusb::Interface>,
 }
 
 /// Create the USB structure
 #[no_mangle]
-pub extern "C" fn cring_usb_create(usb: *mut *mut UsbConnection) -> c_int {
+pub extern "C" fn cring_usb_create(usb: *mut *mut CringUsbConnection) -> c_int {
     if usb.is_null() {
         return err::CRING_EINVAL;
     }
@@ -20,7 +20,7 @@ pub extern "C" fn cring_usb_create(usb: *mut *mut UsbConnection) -> c_int {
     }
 
     unsafe {
-        *usb = Box::into_raw(Box::new(UsbConnection { interface: None }));
+        *usb = Box::into_raw(Box::new(CringUsbConnection { interface: None }));
     }
 
     err::CRING_EOK
@@ -28,7 +28,7 @@ pub extern "C" fn cring_usb_create(usb: *mut *mut UsbConnection) -> c_int {
 
 /// Free the USB structure
 #[no_mangle]
-pub extern "C" fn cring_usb_free(usb: *mut *mut UsbConnection) -> c_int {
+pub extern "C" fn cring_usb_free(usb: *mut *mut CringUsbConnection) -> c_int {
     if usb.is_null() {
         return err::CRING_EINVAL;
     }
@@ -48,7 +48,7 @@ pub extern "C" fn cring_usb_free(usb: *mut *mut UsbConnection) -> c_int {
 /// Connect the USB to the first interface
 #[no_mangle]
 pub extern "C" fn cring_usb_connect(
-    usb: *mut UsbConnection,
+    usb: *mut CringUsbConnection,
     vendor_id: u16,
     product_id: u16,
 ) -> c_int {
@@ -78,7 +78,7 @@ pub extern "C" fn cring_usb_connect(
 /// Send a bulk out message. The endpoint must *not* have its top-bit (`0x80`) set
 #[no_mangle]
 pub extern "C" fn cring_usb_bulk_out(
-    usb: *mut UsbConnection,
+    usb: *mut CringUsbConnection,
     ep: u8,
     data: *const u8,
     len: usize,
@@ -107,7 +107,7 @@ pub extern "C" fn cring_usb_bulk_out(
 /// Send a bulk in message. The endpoint must have its top-bit (`0x80`) set
 #[no_mangle]
 pub extern "C" fn cring_usb_bulk_in(
-    usb: *mut UsbConnection,
+    usb: *mut CringUsbConnection,
     ep: u8,
     data: *mut u8,
     len: usize,
@@ -143,6 +143,54 @@ pub const CRING_ACC_PID: u16 = 0xCAFE;
 pub const CRING_ACC_BOUT_EP: u8 = 0x01;
 pub const CRING_ACC_BIN_EP: u8 = 0x81;
 
+#[no_mangle]
+pub extern "C" fn cring_acc_send_bmp(
+    usb: *mut CringUsbConnection,
+    mut bmp_data: *mut u8,
+    mut bmp_len: usize,
+) -> c_int {
+    let res = cring_usb_bulk_out(usb, CRING_ACC_BOUT_EP, bmp_data, bmp_len);
+    if res < err::CRING_EOK {
+        return res;
+    }
+
+    let mut buffer = [0; 64];
+    let res = cring_usb_bulk_out(usb, CRING_ACC_BOUT_EP, buffer.as_ptr(), 0);
+    if res < err::CRING_EOK {
+        return res;
+    }
+
+    let res = cring_usb_bulk_in(usb, CRING_ACC_BIN_EP, buffer.as_mut_ptr(), 1);
+    if res < err::CRING_EOK {
+        return res;
+    }
+
+    if err::map_from_device_error(buffer[0]) != err::CRING_EOK {
+        return err::map_from_device_error(buffer[0]);
+    }
+
+    loop {
+        let res = cring_usb_bulk_in(usb, CRING_ACC_BIN_EP, bmp_data, bmp_len);
+
+        if res < err::CRING_EOK {
+            return res;
+        }
+
+        if res == 0 {
+            break;
+        } else {
+            bmp_len -= res as usize;
+            bmp_data = unsafe { bmp_data.add(res as usize) };
+        }
+
+        if bmp_len == 0 {
+            break;
+        }
+    }
+
+    err::CRING_EOK
+}
+
 pub mod err {
     use std::ffi::c_int;
 
@@ -156,4 +204,22 @@ pub mod err {
     pub const CRING_ENOTPRESENT: c_int = -3;
     /// There was an error interacting with the USB
     pub const CRING_EUSB: c_int = -4;
+
+    /// Unknown acceleratorinator error
+    pub const CRING_EACC_UNKNOWN: c_int = -100;
+    /// Unsupported compression
+    pub const CRING_EACC_UNSUP_COMP: c_int = -101;
+    /// Parse failure
+    pub const CRING_EACC_PARSE: c_int = -102;
+
+    #[inline(never)]
+    #[no_mangle]
+    pub fn map_from_device_error(e: u8) -> c_int {
+        match e {
+            0 => CRING_EOK,
+            1 => CRING_EACC_UNSUP_COMP,
+            2 => CRING_EACC_PARSE,
+            _ => CRING_EACC_UNKNOWN,
+        }
+    }
 }
