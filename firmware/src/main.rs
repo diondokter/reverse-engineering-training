@@ -2,22 +2,25 @@
 #![no_main]
 
 use core::{
+    fmt::Write,
     panic::PanicInfo,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use bitvec::{field::BitField, order::Lsb0, view::BitView};
-use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_nrf::{
-    bind_interrupts, pac,
+    bind_interrupts,
+    gpio::Output,
+    pac,
     peripherals::{PWM0, USBD},
     pwm::{self, SequencePwm},
-    uarte::{self, UarteTx},
+    uarte::{self, Uarte},
     usb::{self, In, Out},
 };
-use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, mutex::Mutex};
+use embassy_sync::{blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex}, mutex::Mutex};
 use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointOut};
+use heapless::Vec;
 
 bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<embassy_nrf::peripherals::USBD>;
@@ -29,22 +32,43 @@ bind_interrupts!(struct Irqs {
 const DEVICE_INTERFACE_GUIDS: &[&str] = &["{EAA9A5DC-30BA-44BC-9232-606CDC875321}"];
 const MAX_PACKET_SIZE: usize = 64;
 
+static UART: Mutex<CriticalSectionRawMutex, UartWriter> = Mutex::new(UartWriter(None));
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
     let clock: pac::CLOCK = unsafe { core::mem::transmute(()) };
 
-    defmt::info!("Enabling ext hfosc...");
+    let uart = UartWriter(Some(uarte::Uarte::new(
+        p.UARTE0,
+        Irqs,
+        p.P0_08,
+        p.P0_06,
+        Default::default(),
+    )));
+
+    *UART.lock().await = uart;
+
+    writeln!(UART.lock().await, "").unwrap();
+    writeln!(UART.lock().await, "---------------------------------------").unwrap();
+    writeln!(UART.lock().await, "Enabling ext hfosc...").unwrap();
     clock.tasks_hfclkstart.write(|w| unsafe { w.bits(1) });
     while clock.events_hfclkstarted.read().bits() != 1 {}
 
-    defmt::info!("Initialized!");
+    writeln!(UART.lock().await, "Initialized!").unwrap();
 
     // Setup the LED PWM
     let mut config = pwm::Config::default();
     config.prescaler = pwm::Prescaler::Div64;
-    let pwm = defmt::unwrap!(pwm::SequencePwm::new_1ch(p.PWM0, p.P0_13, config));
-    spawner.must_spawn(led_driver(pwm));
+    let pwm = pwm::SequencePwm::new_1ch(p.PWM0, p.P0_13, config).unwrap();
+    spawner.must_spawn(led_driver(
+        pwm,
+        Output::new(
+            p.P0_14,
+            embassy_nrf::gpio::Level::High,
+            embassy_nrf::gpio::OutputDrive::Standard0Disconnect1,
+        ),
+    ));
 
     // Setup the USB
     // Create the driver, from the HAL.
@@ -102,8 +126,8 @@ async fn main(spawner: Spawner) {
         (ep_in, ep_out)
     };
 
-    defmt::info!("{}", ep_in.info());
-    defmt::info!("{}", ep_out.info());
+    writeln!(UART.lock().await, "{:?}", ep_in.info()).unwrap();
+    writeln!(UART.lock().await, "{:?}", ep_out.info()).unwrap();
 
     let mut usb = builder.build();
 
@@ -111,7 +135,7 @@ async fn main(spawner: Spawner) {
         loop {
             if let Err(e) = listen(&mut ep_in, &mut ep_out).await {
                 GLITCHY.store(true, Ordering::Relaxed);
-                defmt::error!("Endpoint error: {}", e);
+                writeln!(UART.lock().await, "Endpoint error: {:?}", e).unwrap();
             }
         }
     };
@@ -119,35 +143,63 @@ async fn main(spawner: Spawner) {
     embassy_futures::join::join(usb.run(), usb_app).await;
 }
 
-static BMP_BUFFER: Mutex<ThreadModeRawMutex, [u8; 128 * 1024]> = Mutex::new([0; 128 * 1024]);
+const BUFFER_SIZE: usize = 100 * 1024;
+static ENCODED_BMP_BUFFER: Mutex<ThreadModeRawMutex, Vec<u8, { BUFFER_SIZE }>> =
+    Mutex::new(Vec::new());
+static DECODED_BMP_BUFFER: Mutex<ThreadModeRawMutex, Vec<u8, { BUFFER_SIZE }>> =
+    Mutex::new(Vec::new());
 
 async fn listen(
     ep_in: &mut embassy_nrf::usb::Endpoint<'_, USBD, In>,
     ep_out: &mut embassy_nrf::usb::Endpoint<'_, USBD, Out>,
 ) -> Result<(), EndpointError> {
-    let mut bmp_buffer = BMP_BUFFER.lock().await;
-    let bmp_buffer = &mut *bmp_buffer;
-    let mut bmp_cursor = 0;
+    let mut encoded_bmp_buffer = ENCODED_BMP_BUFFER.lock().await;
+    let encoded_bmp_buffer = &mut *encoded_bmp_buffer;
+    let mut decoded_bmp_buffer = DECODED_BMP_BUFFER.lock().await;
+    let decoded_bmp_buffer = &mut *decoded_bmp_buffer;
 
     ep_out.wait_enabled().await;
 
-    defmt::info!("Connected!");
+    writeln!(UART.lock().await, "Connected!").unwrap();
+
+    let mut buffer = [0; MAX_PACKET_SIZE];
 
     loop {
-        let len = ep_out.read(&mut bmp_buffer[bmp_cursor..]).await?;
-        bmp_cursor += len;
+        let len = ep_out.read(&mut buffer).await?;
+
+        if encoded_bmp_buffer.extend_from_slice(&buffer[..len]).is_err() {
+            panic!("The receive buffer is full");
+        }
 
         if len == 0 {
-            defmt::info!(
+            writeln!(
+                UART.lock().await,
                 "@ {} - Received bmp, total: {}",
                 embassy_time::Instant::now().as_millis(),
-                bmp_cursor
-            );
+                encoded_bmp_buffer.len(),
+            )
+            .unwrap();
+
+            embassy_futures::yield_now().await;
+
+            cring_rle_decode(encoded_bmp_buffer, decoded_bmp_buffer);
+
+            embassy_futures::yield_now().await;
+
+            writeln!(
+                UART.lock().await,
+                "@ {} - Decoded bmp, total: {}",
+                embassy_time::Instant::now().as_millis(),
+                decoded_bmp_buffer.len(),
+            )
+            .unwrap();
 
             // Last message, so do the bmp thing
             let error = 'e: {
-                match tinybmp::RawBmp::from_slice(&bmp_buffer[..bmp_cursor]) {
+                match tinybmp::RawBmp::from_slice(&decoded_bmp_buffer) {
                     Ok(bmp) => {
+                        embassy_futures::yield_now().await;
+
                         let header = bmp.header().clone();
 
                         let image_data_len = if header.image_data_len == 0 {
@@ -157,9 +209,10 @@ async fn listen(
                                 / 8) as usize
                         } else {
                             header.image_data_len as usize
-                        };
+                        }
+                        .min(decoded_bmp_buffer[header.image_data_start..].len());
 
-                        let image_bits_view = bmp_buffer[header.image_data_start..]
+                        let image_bits_view = decoded_bmp_buffer[header.image_data_start..]
                             [..image_data_len]
                             .view_bits_mut::<Lsb0>();
 
@@ -169,6 +222,8 @@ async fn listen(
                         ) {
                             break 'e Error::UnsupportedCompression;
                         }
+
+                        embassy_futures::yield_now().await;
 
                         let color_ranges = if let Some(channel_masks) = header.channel_masks {
                             let start = channel_masks.red.trailing_zeros() as usize;
@@ -189,6 +244,8 @@ async fn listen(
                         };
 
                         for pixel in image_bits_view.chunks_exact_mut(header.bpp.bits() as usize) {
+                            embassy_futures::yield_now().await;
+
                             if let Some((red, green, blue)) = color_ranges.as_ref() {
                                 let value = pixel[red.clone()].load_le::<u8>();
                                 pixel[red.clone()].store_le(u8::MAX - value);
@@ -202,38 +259,57 @@ async fn listen(
                                 pixel.store_le(u32::MAX - pixel.load_le::<u32>());
                             }
                         }
+
+                        writeln!(
+                            UART.lock().await,
+                            "@ {} - Processing done. Starting encoding",
+                            embassy_time::Instant::now().as_millis(),
+                        )
+                        .unwrap();
+
+                        embassy_futures::yield_now().await;
+
+                        cring_rle_encode(&decoded_bmp_buffer, encoded_bmp_buffer);
+
+                        embassy_futures::yield_now().await;
+
                         Error::Ok
                     }
                     Err(e) => {
-                        defmt::error!("BMP parse error: {}", defmt::Debug2Format(&e));
+                        writeln!(UART.lock().await, "BMP parse error: {:?}", e).unwrap();
                         Error::ParseError
                     }
                 }
             };
 
-            defmt::info!(
+            writeln!(
+                UART.lock().await,
                 "@ {} - Processing done. Starting send back",
                 embassy_time::Instant::now().as_millis(),
-            );
+            )
+            .unwrap();
 
             ep_in.write(&[error as u8]).await?;
 
             if let Error::Ok = error {
                 GLITCHY.store(false, Ordering::Relaxed);
 
-                for chunk in bmp_buffer[..bmp_cursor].chunks(MAX_PACKET_SIZE) {
+                for chunk in encoded_bmp_buffer.chunks(MAX_PACKET_SIZE) {
                     ep_in.write(chunk).await?;
                 }
             } else {
                 GLITCHY.store(true, Ordering::Relaxed);
             }
 
-            defmt::info!(
+            writeln!(
+                UART.lock().await,
                 "@ {} - Send back complete. Waiting for next bmp",
                 embassy_time::Instant::now().as_millis(),
-            );
+            )
+            .unwrap();
 
-            bmp_cursor = 0;
+            decoded_bmp_buffer.clear();
+            encoded_bmp_buffer.clear();
         }
     }
 }
@@ -249,7 +325,7 @@ enum Error {
 static GLITCHY: AtomicBool = AtomicBool::new(false);
 
 #[embassy_executor::task]
-async fn led_driver(mut pwm: SequencePwm<'static, PWM0>) {
+async fn led_driver(mut pwm: SequencePwm<'static, PWM0>, mut led2: Output<'static>) {
     let sin_words: [u16; 150] = SIN.clone();
     let glitch_words: [u16; 150] = GLITCHY_SIN.clone();
 
@@ -259,14 +335,15 @@ async fn led_driver(mut pwm: SequencePwm<'static, PWM0>) {
     let mut sequencer;
 
     loop {
-        let selected_words = if GLITCHY.fetch_xor(true, Ordering::Relaxed) {
+        led2.toggle();
+        let selected_words = if GLITCHY.load(Ordering::Relaxed) {
             &glitch_words
         } else {
             &sin_words
         };
 
         sequencer = pwm::SingleSequencer::new(&mut pwm, selected_words, seq_config.clone());
-        defmt::unwrap!(sequencer.start(pwm::SingleSequenceMode::Infinite));
+        sequencer.start(pwm::SingleSequenceMode::Infinite).unwrap();
 
         embassy_time::Timer::after_millis(1200).await;
         drop(sequencer);
@@ -305,34 +382,172 @@ const GLITCHY_SIN: [u16; 150] = [
     0x0057, 0x00BE, 0x0079, 0x0078, 0x016A, 0x00CD,
 ];
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    use core::fmt::Write;
-
-    cortex_m::interrupt::disable();
-
-    defmt::error!("{}", defmt::Debug2Format(info));
-
-    let uart = uarte::UarteTx::new(
-        unsafe { embassy_nrf::peripherals::UARTE0::steal() },
-        Irqs,
-        unsafe { embassy_nrf::peripherals::P0_06::steal() },
-        Default::default(),
-    );
-
-    write!(UartWriter(uart), "{info}").ok();
+#[cortex_m_rt::exception]
+unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
+    if let Ok(mut uart) = UART.try_lock() {
+        let _ = writeln!(uart, "{ef:?}");
+    }
 
     loop {
-        cortex_m::asm::bkpt();
+        cortex_m::asm::delay(32_000_000);
+        cortex_m::peripheral::SCB::sys_reset();
     }
 }
 
-struct UartWriter(UarteTx<'static, embassy_nrf::peripherals::UARTE0>);
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    cortex_m::interrupt::disable();
+
+    if let Ok(mut uart) = UART.try_lock() {
+        let _ = writeln!(uart, "{info}");
+    }
+
+    loop {
+        cortex_m::asm::delay(32_000_000);
+        cortex_m::peripheral::SCB::sys_reset();
+    }
+}
+
+struct UartWriter(Option<Uarte<'static, embassy_nrf::peripherals::UARTE0>>);
 
 impl core::fmt::Write for UartWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         self.0
+            .as_mut()
+            .unwrap()
             .blocking_write(s.as_bytes())
             .map_err(|_| Default::default())
     }
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_encode(mut input: &[u8], output: &mut Vec<u8, { BUFFER_SIZE }>) {
+    output.clear();
+
+    while !input.is_empty() {
+        let mut possible_block_savings = [u16::MAX; 4];
+        let max_len = input.len().min(32);
+
+        possible_block_savings[0] =
+            cring_rle_calc_block_savings_frac((max_len + 1) as u8, max_len as u8);
+        for block_size in 1..=3 {
+            let max_repeat_count = match cring_rle_calc_max_block_repeats(input, block_size) {
+                Some(value) => value,
+                None => continue,
+            };
+
+            possible_block_savings[block_size] = cring_rle_calc_block_savings_frac(
+                (block_size + 1) as u8,
+                (block_size * max_repeat_count) as u8,
+            );
+        }
+
+        let (best_block_size, _) = possible_block_savings
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, val)| **val)
+            .unwrap();
+
+        if best_block_size == 0 {
+            cring_rle_push_on_vec(output, cring_rle_calc_header(max_len as u8, 0));
+            for b in &input[..max_len] {
+                cring_rle_push_on_vec(output, *b);
+            }
+
+            input = &input[max_len..];
+        } else {
+            let repeats = cring_rle_calc_max_block_repeats(input, best_block_size).unwrap();
+            cring_rle_push_on_vec(
+                output,
+                cring_rle_calc_header(repeats as u8, best_block_size as u8),
+            );
+            for b in &input[..best_block_size] {
+                cring_rle_push_on_vec(output, *b);
+            }
+
+            input = &input[repeats * best_block_size..];
+        }
+    }
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_decode(mut input: &[u8], output: &mut Vec<u8, { BUFFER_SIZE }>) {
+    output.clear();
+
+    while !input.is_empty() {
+        let header = input[0];
+        let block_size = cring_rle_get_header_block_size(header);
+        let repeats = cring_rle_get_header_len(header);
+
+        // defmt::println!("Block size: {}", block_size);
+        // defmt::println!("Repeats: {}", repeats);
+
+        if block_size == 0 {
+            for b in &input[1..][..repeats as usize] {
+                cring_rle_push_on_vec(output, *b);
+            }
+
+            input = &input[repeats as usize + 1..];
+        } else {
+            for _ in 0..repeats {
+                for b in &input[1..][..block_size as usize] {
+                    cring_rle_push_on_vec(output, *b);
+                }
+            }
+
+            input = &input[(block_size as usize) + 1..];
+        }
+    }
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_calc_header(len: u8, block_size: u8) -> u8 {
+    // assert!(len <= 64, "Can only encode 64 repeats max");
+    assert!(len != 0, "Must encode at least 1 byte");
+    assert!(block_size < 4, "Block size must be less than 4");
+
+    ((len - 1) << 2) | block_size
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_get_header_len(header: u8) -> u8 {
+    ((header & 0xFC) >> 2) + 1
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_get_header_block_size(header: u8) -> u8 {
+    header & 0x03
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_push_on_vec(vec: &mut Vec<u8, { BUFFER_SIZE }>, val: u8) {
+    vec.push(val).ok();
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_calc_max_block_repeats(input: &[u8], block_size: usize) -> Option<usize> {
+    let repeat_value = match input.get(0..block_size) {
+        Some(repeat_value) => repeat_value,
+        None => return None,
+    };
+
+    let max_repeat_count = input
+        .chunks_exact(block_size)
+        .take_while(|chunk| *chunk == repeat_value)
+        .count();
+
+    Some(max_repeat_count)
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_calc_block_savings_frac(output_size: u8, input_size: u8) -> u16 {
+    1000u16 * output_size as u16 / input_size as u16
 }

@@ -10,6 +10,7 @@ pub struct CringUsbConnection {
 
 /// Create the USB structure
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn cring_usb_create(usb: *mut *mut CringUsbConnection) -> c_int {
     if usb.is_null() {
         return err::CRING_EINVAL;
@@ -28,6 +29,7 @@ pub extern "C" fn cring_usb_create(usb: *mut *mut CringUsbConnection) -> c_int {
 
 /// Free the USB structure
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn cring_usb_free(usb: *mut *mut CringUsbConnection) -> c_int {
     if usb.is_null() {
         return err::CRING_EINVAL;
@@ -47,6 +49,7 @@ pub extern "C" fn cring_usb_free(usb: *mut *mut CringUsbConnection) -> c_int {
 
 /// Connect the USB to the first interface
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn cring_usb_connect(
     usb: *mut CringUsbConnection,
     vendor_id: u16,
@@ -77,6 +80,7 @@ pub extern "C" fn cring_usb_connect(
 
 /// Send a bulk out message. The endpoint must *not* have its top-bit (`0x80`) set
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn cring_usb_bulk_out(
     usb: *mut CringUsbConnection,
     ep: u8,
@@ -106,6 +110,7 @@ pub extern "C" fn cring_usb_bulk_out(
 
 /// Send a bulk in message. The endpoint must have its top-bit (`0x80`) set
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn cring_usb_bulk_in(
     usb: *mut CringUsbConnection,
     ep: u8,
@@ -144,12 +149,24 @@ pub const CRING_ACC_BOUT_EP: u8 = 0x01;
 pub const CRING_ACC_BIN_EP: u8 = 0x81;
 
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn cring_acc_send_bmp(
     usb: *mut CringUsbConnection,
-    mut bmp_data: *mut u8,
-    mut bmp_len: usize,
+    bmp_data: *mut u8,
+    bmp_len: usize,
 ) -> c_int {
-    let res = cring_usb_bulk_out(usb, CRING_ACC_BOUT_EP, bmp_data, bmp_len);
+    if bmp_data.is_null() {
+        return err::CRING_EINVAL;
+    }
+
+    if bmp_len == 0 {
+        return err::CRING_EINVAL;
+    }
+
+    let mut encoded =
+        cring_rle_encode(unsafe { std::slice::from_raw_parts_mut(bmp_data, bmp_len) });
+
+    let res = cring_usb_bulk_out(usb, CRING_ACC_BOUT_EP, encoded.as_ptr(), encoded.len());
     if res < err::CRING_EOK {
         return res;
     }
@@ -165,30 +182,171 @@ pub extern "C" fn cring_acc_send_bmp(
         return res;
     }
 
-    if err::map_from_device_error(buffer[0]) != err::CRING_EOK {
-        return err::map_from_device_error(buffer[0]);
+    if err::cring_map_from_device_error(buffer[0]) != err::CRING_EOK {
+        return err::cring_map_from_device_error(buffer[0]);
     }
 
-    loop {
-        let res = cring_usb_bulk_in(usb, CRING_ACC_BIN_EP, bmp_data, bmp_len);
+    let res = cring_usb_bulk_in(usb, CRING_ACC_BIN_EP, encoded.as_mut_ptr(), encoded.len());
 
-        if res < err::CRING_EOK {
-            return res;
-        }
-
-        if res == 0 {
-            break;
-        } else {
-            bmp_len -= res as usize;
-            bmp_data = unsafe { bmp_data.add(res as usize) };
-        }
-
-        if bmp_len == 0 {
-            break;
-        }
+    if res < err::CRING_EOK {
+        return res;
     }
+
+    encoded.truncate(res as usize);
+
+    let decoded = cring_rle_decode(&encoded);
+
+    let bmp_data_slice = unsafe { std::slice::from_raw_parts_mut(bmp_data, bmp_len) };
+    let min_len = decoded.len().min(bmp_data_slice.len());
+    bmp_data_slice[..min_len].copy_from_slice(&decoded[..min_len]);
 
     err::CRING_EOK
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_encode(mut input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+
+    while !input.is_empty() {
+        let mut possible_block_savings = [u16::MAX; 4];
+        let max_len = input.len().min(32);
+
+        possible_block_savings[0] =
+            cring_rle_calc_block_savings_frac((max_len + 1) as u8, max_len as u8);
+        for block_size in 1..=3 {
+            let max_repeat_count = match cring_rle_calc_max_block_repeats(input, block_size) {
+                Some(value) => value,
+                None => continue,
+            };
+
+            possible_block_savings[block_size] = cring_rle_calc_block_savings_frac(
+                (block_size + 1) as u8,
+                (block_size * max_repeat_count) as u8,
+            );
+        }
+
+        let (best_block_size, _) = possible_block_savings
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, val)| **val)
+            .unwrap();
+
+        if best_block_size == 0 {
+            cring_rle_push_on_vec(&mut output, cring_rle_calc_header(max_len as u8, 0));
+            for b in &input[..max_len] {
+                cring_rle_push_on_vec(&mut output, *b);
+            }
+
+            input = &input[max_len..];
+        } else {
+            let repeats = cring_rle_calc_max_block_repeats(input, best_block_size).unwrap();
+            cring_rle_push_on_vec(
+                &mut output,
+                cring_rle_calc_header(repeats as u8, best_block_size as u8),
+            );
+            for b in &input[..best_block_size] {
+                cring_rle_push_on_vec(&mut output, *b);
+            }
+
+            input = &input[repeats * best_block_size..];
+        }
+    }
+
+    output
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_decode(mut input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+
+    let mut max_repeats = 0;
+
+    while !input.is_empty() {
+        let header = input[0];
+        let block_size = cring_rle_get_header_block_size(header);
+        let repeats = cring_rle_get_header_len(header);
+
+        if block_size != 0 && repeats > max_repeats {
+            max_repeats = repeats;
+        }
+
+        // println!("Block size: {block_size}");
+        // println!("Repeats: {repeats}");
+        // println!("in:  {input:X?}");
+        // println!("out: {output:X?}");
+
+        if block_size == 0 {
+            for b in &input[1..][..repeats as usize] {
+                cring_rle_push_on_vec(&mut output, *b);
+            }
+
+            input = &input[repeats as usize + 1..];
+        } else {
+            for _ in 0..repeats {
+                for b in &input[1..][..block_size as usize] {
+                    cring_rle_push_on_vec(&mut output, *b);
+                }
+            }
+
+            input = &input[(block_size as usize) + 1..];
+        }
+    }
+
+    // println!("Max repeats: {max_repeats}");
+
+    output
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_calc_header(len: u8, block_size: u8) -> u8 {
+    // assert!(len <= 64, "Can only encode 64 repeats max");
+    assert!(len != 0, "Must encode at least 1 byte");
+    assert!(block_size < 4, "Block size must be less than 4");
+
+    ((len - 1) << 2) | block_size
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_get_header_len(header: u8) -> u8 {
+    ((header & 0xFC) >> 2) + 1
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_get_header_block_size(header: u8) -> u8 {
+    header & 0x03
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_push_on_vec(vec: &mut Vec<u8>, val: u8) {
+    vec.push(val);
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_calc_max_block_repeats(input: &[u8], block_size: usize) -> Option<usize> {
+    let repeat_value = match input.get(0..block_size) {
+        Some(repeat_value) => repeat_value,
+        None => return None,
+    };
+
+    let max_repeat_count = input
+        .chunks_exact(block_size)
+        .take_while(|chunk| *chunk == repeat_value)
+        .count();
+
+    Some(max_repeat_count)
+}
+
+#[inline(never)]
+#[no_mangle]
+fn cring_rle_calc_block_savings_frac(output_size: u8, input_size: u8) -> u16 {
+    1000u16 * output_size as u16 / input_size as u16
 }
 
 pub mod err {
@@ -214,12 +372,63 @@ pub mod err {
 
     #[inline(never)]
     #[no_mangle]
-    pub fn map_from_device_error(e: u8) -> c_int {
+    pub fn cring_map_from_device_error(e: u8) -> c_int {
         match e {
             0 => CRING_EOK,
             1 => CRING_EACC_UNSUP_COMP,
             2 => CRING_EACC_PARSE,
             _ => CRING_EACC_UNKNOWN,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rle_encode_correct() {
+        assert_eq!(cring_rle_encode(&[]), &[]);
+        assert_eq!(
+            cring_rle_encode(&[0, 1, 2, 3, 4, 5, 6]),
+            &[6 << 2 | 0, 0, 1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            cring_rle_encode(&[0, 0, 2, 3, 4, 5, 6]),
+            &[1 << 2 | 1, 0, 4 << 2 | 0, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            cring_rle_encode(&[0, 0, 2, 3, 4, 2, 3, 4]),
+            &[1 << 2 | 1, 0, 1 << 2 | 3, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn rle_round_trip() {
+        test_round_trip(&[]);
+        test_round_trip(&[0, 1, 2, 3, 4, 5, 6]);
+        test_round_trip(&[0, 0, 2, 3, 4, 5, 6]);
+        test_round_trip(&[0, 0, 2, 3, 4, 2, 3, 4]);
+        test_round_trip(include_bytes!("../../Bird inverted.bmp"));
+        test_round_trip(include_bytes!("../../Tg inverted.bmp"));
+    }
+
+    #[test]
+    #[should_panic]
+    fn rle_round_trip_bad() {
+        test_round_trip(include_bytes!("../../Cring electronics inverted.bmp"));
+    }
+
+    fn test_round_trip(input: &[u8]) {
+        let encoded = cring_rle_encode(input);
+        let output = cring_rle_decode(&encoded);
+
+        println!(
+            "input: {}, encoded: {}, factor: {}",
+            input.len(),
+            encoded.len(),
+            encoded.len() as f32 / input.len() as f32
+        );
+        assert!(input == output);
     }
 }
