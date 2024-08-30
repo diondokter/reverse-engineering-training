@@ -18,7 +18,11 @@ use embassy_nrf::{
     uarte::{self, Uarte},
     usb::{self, In, Out},
 };
-use embassy_sync::{blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex}, mutex::Mutex};
+use embassy_sync::{
+    blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex},
+    mutex::Mutex,
+};
+use embassy_time::Duration;
 use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointOut};
 use heapless::Vec;
 
@@ -167,7 +171,10 @@ async fn listen(
     loop {
         let len = ep_out.read(&mut buffer).await?;
 
-        if encoded_bmp_buffer.extend_from_slice(&buffer[..len]).is_err() {
+        if encoded_bmp_buffer
+            .extend_from_slice(&buffer[..len])
+            .is_err()
+        {
             panic!("The receive buffer is full");
         }
 
@@ -289,16 +296,33 @@ async fn listen(
             )
             .unwrap();
 
-            ep_in.write(&[error as u8]).await?;
+            let send_back_result = embassy_time::with_timeout(Duration::from_secs(1), async {
+                ep_in.write(&[error as u8]).await?;
 
-            if let Error::Ok = error {
-                GLITCHY.store(false, Ordering::Relaxed);
+                if let Error::Ok = error {
+                    GLITCHY.store(false, Ordering::Relaxed);
 
-                for chunk in encoded_bmp_buffer.chunks(MAX_PACKET_SIZE) {
-                    ep_in.write(chunk).await?;
+                    for chunk in encoded_bmp_buffer.chunks(MAX_PACKET_SIZE) {
+                        ep_in.write(chunk).await?;
+                    }
+                } else {
+                    GLITCHY.store(true, Ordering::Relaxed);
                 }
-            } else {
-                GLITCHY.store(true, Ordering::Relaxed);
+
+                Result::<(), EndpointError>::Ok(())
+            })
+            .await;
+
+            match send_back_result {
+                Ok(r) => r?,
+                Err(_) => {
+                    writeln!(
+                        UART.lock().await,
+                        "@ {} - Send back timeout. Not everything could be sent back in time",
+                        embassy_time::Instant::now().as_millis(),
+                    )
+                    .unwrap();
+                }
             }
 
             writeln!(

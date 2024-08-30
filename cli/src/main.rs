@@ -19,6 +19,12 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // Easier setup for debugging:
+    // let args = Args {
+    //     bmp_path: "../Bird-inverted.bmp".into(),
+    //     output_path: "../output.bmp".into(),
+    // };
+
     let mut image = Vec::new();
     File::open(args.bmp_path)?.read_to_end(&mut image)?;
 
@@ -36,18 +42,16 @@ fn main() -> anyhow::Result<()> {
             )
         })?;
 
-        loop {
-            println!("Sending BMP image");
-            wrap(|| {
-                acceleratorinator_sys::cring_acc_send_bmp(
-                    connection,
-                    image.as_mut_ptr(),
-                    image.len(),
-                )
-            })?;
-            
-            File::create(&args.output_path)?.write_all(&image)?;
-        }
+        println!("Sending BMP image");
+        wrap(|| {
+            acceleratorinator_sys::cring_acc_send_bmp(
+                connection,
+                image.as_mut_ptr(),
+                image.len(),
+            )
+        })?;
+        
+        File::create(&args.output_path)?.write_all(&image)?;
 
         println!("Done. Freeing USB");
         wrap(|| acceleratorinator_sys::cring_usb_free(&mut connection as *mut _))?;

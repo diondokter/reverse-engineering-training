@@ -261,21 +261,10 @@ fn cring_rle_encode(mut input: &[u8]) -> Vec<u8> {
 fn cring_rle_decode(mut input: &[u8]) -> Vec<u8> {
     let mut output = Vec::new();
 
-    let mut max_repeats = 0;
-
     while !input.is_empty() {
         let header = input[0];
         let block_size = cring_rle_get_header_block_size(header);
         let repeats = cring_rle_get_header_len(header);
-
-        if block_size != 0 && repeats > max_repeats {
-            max_repeats = repeats;
-        }
-
-        // println!("Block size: {block_size}");
-        // println!("Repeats: {repeats}");
-        // println!("in:  {input:X?}");
-        // println!("out: {output:X?}");
 
         if block_size == 0 {
             for b in &input[1..][..repeats as usize] {
@@ -293,8 +282,6 @@ fn cring_rle_decode(mut input: &[u8]) -> Vec<u8> {
             input = &input[(block_size as usize) + 1..];
         }
     }
-
-    // println!("Max repeats: {max_repeats}");
 
     output
 }
@@ -409,14 +396,14 @@ mod tests {
         test_round_trip(&[0, 1, 2, 3, 4, 5, 6]);
         test_round_trip(&[0, 0, 2, 3, 4, 5, 6]);
         test_round_trip(&[0, 0, 2, 3, 4, 2, 3, 4]);
-        test_round_trip(include_bytes!("../../Bird inverted.bmp"));
-        test_round_trip(include_bytes!("../../Tg inverted.bmp"));
+        test_round_trip(include_bytes!("../../Bird-inverted.bmp"));
+        test_round_trip(include_bytes!("../../Tg-inverted.bmp"));
     }
 
     #[test]
     #[should_panic]
     fn rle_round_trip_bad() {
-        test_round_trip(include_bytes!("../../Cring electronics inverted.bmp"));
+        test_round_trip(include_bytes!("../../Cring-electronics-inverted.bmp"));
     }
 
     fn test_round_trip(input: &[u8]) {
