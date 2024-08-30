@@ -4,6 +4,10 @@ This project is a USB video accelerator project for the nRF52840.
 
 Inverting the colors of a BMP image is a lot of work, best done by an external device.
 
+Note: Dynamic linking is used! So when executing the CLI binary,
+make sure the `libacceleratorinator.so` file is in your working directory.
+`cargo run` is set up to also 'just' work.
+
 ## USB setup
 
 ### Linux
