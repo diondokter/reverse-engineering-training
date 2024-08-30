@@ -1,1 +1,1 @@
-#include "../acceleratorinator/target/acceleratorinator.h"
+#include "../third-party/acceleratorinator.h"

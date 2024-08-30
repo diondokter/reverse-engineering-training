@@ -2,23 +2,6 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rustc-link-search=../acceleratorinator/target/release");
-    println!("cargo:rerun-if-changed=../acceleratorinator/target/release");
-
-    println!("cargo:rustc-link-lib=static=acceleratorinator");
-
-    let native_libs: &[&str] = if cfg!(windows) {
-        &["winusb", "cfgmgr32", "ole32"]
-    } else if cfg!(unix) {
-        &[]
-    } else {
-        todo!()
-    };
-
-    for nl in native_libs {
-        println!("cargo:rustc-link-lib={nl}");
-    }
-
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
         .use_core()
