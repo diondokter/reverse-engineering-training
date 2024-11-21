@@ -8,6 +8,8 @@ Note: Dynamic linking is used! So when executing the CLI binary,
 make sure the `libacceleratorinator.so` file is in your working directory.
 `cargo run` is set up to also 'just' work.
 
+Only a linux .so file is provided, so make sure to use Linux.
+
 ## USB setup
 
 ### Linux
